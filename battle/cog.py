@@ -2,254 +2,189 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands
 from dataclasses import dataclass, field
-from typing import List, Dict
+from typing import List, Dict, Optional
 import random
-import asyncio
 import io
 
-# -------------------------
-# Models / Dataclasses
-# -------------------------
+from ballsdex.core.models import BallInstance, Player
+from ballsdex.settings import settings
+from ballsdex.packages.battle.xe_battle_lib import BattleBall, BattleInstance, gen_battle
 
-SPECIAL_BUFFS = {
-    "Shiny": {"health": 2500, "attack": 2500},
-    "Robot": {"health": 100, "attack": 100},
-    "Mythic": {"health": 7500, "attack": 7500},
-    "Global Superpower": {"health": 3750, "attack": 3750},
-}
-
+# -------------------------
+# Guild Battle container
+# -------------------------
 @dataclass
-class Ball:
-    name: str
-    owner_id: int
-    health: int
-    attack: int
-    shiny: bool = False
-    special: str = ""
-    dead: bool = False
+class GuildBattle:
+    interaction: discord.Interaction
+    author: discord.Member
+    opponent: discord.Member
+    author_ready: bool = False
+    opponent_ready: bool = False
+    battle: BattleInstance = field(default_factory=BattleInstance)
 
-@dataclass
-class BattleInstance:
-    battle_id: int
-    mode: str  # "solo" or "multiplayer"
-    teams: Dict[int, List[int]] = field(default_factory=lambda: {0: [], 1: []})
-    players_balls: Dict[int, List[Ball]] = field(default_factory=dict)
-    ready_players: Dict[int, bool] = field(default_factory=dict)
-    turn_order: List[int] = field(default_factory=list)
-    current_turn_index: int = 0
-    started: bool = False
-    winner: str = ""
-    logs: List[str] = field(default_factory=list)
+battles: List[GuildBattle] = []
 
-# -------------------------
-# Battle Logic
-# -------------------------
+MAX_BALLS = 50
 
-def apply_special_buffs(ball: Ball):
-    if ball.shiny:
-        buff = SPECIAL_BUFFS["Shiny"]
-        ball.health += buff["health"]
-        ball.attack += buff["attack"]
-    if ball.special in SPECIAL_BUFFS:
-        buff = SPECIAL_BUFFS[ball.special]
-        ball.health += buff["health"]
-        ball.attack += buff["attack"]
+def gen_deck(balls: List[BattleBall]) -> str:
+    if not balls:
+        return "Empty"
+    deck = "\n".join(f"- {b.emoji} {b.name} (HP: {b.health} | DMG: {b.attack})" for b in balls)
+    return deck[:1024] + ("\n<truncated>" if len(deck) > 1024 else "")
 
-def get_damage(ball: Ball):
-    return int(ball.attack * random.uniform(0.8, 1.2))
+def update_embed(author_balls, opponent_balls, author, opponent, author_ready, opponent_ready):
+    embed = discord.Embed(
+        title=f"{settings.plural_collectible_name.title()} Battle Plan",
+        description=f"Use /battle add/remove to edit your deck. Click Ready to start.",
+        color=discord.Color.blurple()
+    )
+    embed.add_field(name=f"{'✔' if author_ready else ''} {author}'s deck:", value=gen_deck(author_balls), inline=True)
+    embed.add_field(name=f"{'✔' if opponent_ready else ''} {opponent}'s deck:", value=gen_deck(opponent_balls), inline=True)
+    return embed
 
-def attack(attacker: Ball, targets: List[Ball]):
-    alive_targets = [b for b in targets if not b.dead]
-    if not alive_targets:
-        return "No valid targets."
+def create_disabled_buttons() -> discord.ui.View:
+    view = ui.View()
+    view.add_item(ui.Button(style=discord.ButtonStyle.success, emoji="✔", label="Ready", disabled=True))
+    view.add_item(ui.Button(style=discord.ButtonStyle.danger, emoji="✖", label="Cancel", disabled=True))
+    return view
 
-    target = random.choice(alive_targets)
-    dmg = get_damage(attacker)
-    target.health -= dmg
-    if target.health <= 0:
-        target.dead = True
-        target.health = 0
-        return f"{attacker.name} killed {target.name}!"
-    else:
-        return f"{attacker.name} dealt {dmg} damage to {target.name}."
-
-def next_turn(battle: BattleInstance):
-    battle.current_turn_index = (battle.current_turn_index + 1) % len(battle.turn_order)
-    return battle.turn_order[battle.current_turn_index]
-
-def is_battle_over(battle: BattleInstance):
-    alive_teams = []
-    for team, players in battle.teams.items():
-        if any(ball.dead is False for pid in players for ball in battle.players_balls.get(pid, [])):
-            alive_teams.append(team)
-    return len(alive_teams) <= 1
+def fetch_battle(user: discord.User) -> Optional[GuildBattle]:
+    for b in battles:
+        if user in (b.author, b.opponent):
+            return b
+    return None
 
 # -------------------------
-# Discord Bot Cog
+# Full Battle Cog
 # -------------------------
-
-class BattleCog(commands.Cog):
+class FullBattleSystemCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.battles: Dict[int, BattleInstance] = {}
-        self.battle_counter = 1000
 
     # -------------------------
     # /battle start
     # -------------------------
-    @app_commands.command(name="battle_start")
-    async def start(self, interaction: discord.Interaction, mode: str = "solo", users: int = 1):
-        """Start a battle: mode=solo/multiplayer, users=# per team"""
-        if mode not in ["solo", "multiplayer"]:
-            await interaction.response.send_message("Mode must be 'solo' or 'multiplayer'.", ephemeral=True)
+    @app_commands.command()
+    async def battle(self, interaction: discord.Interaction, opponent: discord.Member):
+        if opponent.bot or opponent == interaction.user:
+            await interaction.response.send_message("Invalid opponent.", ephemeral=True)
+            return
+        if fetch_battle(interaction.user) or fetch_battle(opponent):
+            await interaction.response.send_message("Either you or opponent is already in a battle.", ephemeral=True)
             return
 
-        battle_id = self.battle_counter
-        self.battle_counter += 1
+        gb = GuildBattle(interaction, interaction.user, opponent)
+        battles.append(gb)
+        embed = update_embed([], [], interaction.user.name, opponent.name, False, False)
 
-        battle = BattleInstance(battle_id=battle_id, mode=mode)
-        self.battles[battle_id] = battle
+        start_btn = ui.Button(style=discord.ButtonStyle.success, emoji="✔", label="Ready")
+        cancel_btn = ui.Button(style=discord.ButtonStyle.danger, emoji="✖", label="Cancel")
+        view = ui.View(timeout=None)
+        view.add_item(start_btn)
+        view.add_item(cancel_btn)
 
-        # Register starter player
-        battle.teams[0].append(interaction.user.id)
-        battle.players_balls[interaction.user.id] = []
-        battle.ready_players[interaction.user.id] = False
-        battle.turn_order.append(interaction.user.id)
+        start_btn.callback = lambda i: self.start_battle(i)
+        cancel_btn.callback = lambda i: self.cancel_battle(i)
 
-        if mode == "solo":
-            await interaction.response.send_message(f"Solo battle created! ID: {battle_id}. Opponent can be challenged.", ephemeral=True)
+        await interaction.response.send_message(f"{opponent.mention}, {interaction.user.name} challenged you!", embed=embed, view=view)
+
+    # -------------------------
+    # Add / Remove Balls
+    # -------------------------
+    async def add_balls(self, interaction: discord.Interaction, balls: List[BallInstance]):
+        gb = fetch_battle(interaction.user)
+        if not gb:
+            return 0
+
+        user_balls = gb.battle.p1_balls if interaction.user == gb.author else gb.battle.p2_balls
+        added = 0
+        for b in balls:
+            bb = BattleBall(
+                b.countryball.country,
+                interaction.user.name,
+                b.health,
+                b.attack,
+                self.bot.get_emoji(b.countryball.emoji_id)
+            )
+            if len(user_balls) >= MAX_BALLS:
+                break
+            if bb not in user_balls:
+                user_balls.append(bb)
+                added += 1
+
+        await gb.interaction.edit_original_response(embed=update_embed(
+            gb.battle.p1_balls, gb.battle.p2_balls, gb.author.name, gb.opponent.name, gb.author_ready, gb.opponent_ready
+        ))
+        return added
+
+    async def remove_balls(self, interaction: discord.Interaction, balls: List[BallInstance]):
+        gb = fetch_battle(interaction.user)
+        if not gb:
+            return 0
+
+        user_balls = gb.battle.p1_balls if interaction.user == gb.author else gb.battle.p2_balls
+        removed = 0
+        for b in balls:
+            bb = BattleBall(
+                b.countryball.country,
+                interaction.user.name,
+                b.health,
+                b.attack,
+                self.bot.get_emoji(b.countryball.emoji_id)
+            )
+            if bb in user_balls:
+                user_balls.remove(bb)
+                removed += 1
+
+        await gb.interaction.edit_original_response(embed=update_embed(
+            gb.battle.p1_balls, gb.battle.p2_balls, gb.author.name, gb.opponent.name, gb.author_ready, gb.opponent_ready
+        ))
+        return removed
+
+    # -------------------------
+    # /battle add single
+    # -------------------------
+    @app_commands.command()
+    async def add(self, interaction: discord.Interaction, ball: BallInstance):
+        count = await self.add_balls(interaction, [ball])
+        if count == 0:
+            await interaction.response.send_message("Ball already in deck or max reached.", ephemeral=True)
         else:
-            await interaction.response.send_message(f"Multiplayer battle created! ID: {battle_id}. Players can now join.", ephemeral=True)
+            await interaction.response.send_message(f"Added {ball.countryball.country} to deck.", ephemeral=True)
 
     # -------------------------
-    # /battle add
+    # /battle remove single
     # -------------------------
-    @app_commands.command(name="battle_add")
-    async def add(self, interaction: discord.Interaction, name: str, health: int, attack: int, shiny: bool = False, special: str = ""):
-        """Add a ball to your pre-battle deck"""
-        battle = next((b for b in self.battles.values() if interaction.user.id in b.players_balls), None)
-        if not battle:
-            await interaction.response.send_message("You are not in a battle.", ephemeral=True)
-            return
-
-        if battle.ready_players.get(interaction.user.id, False):
-            await interaction.response.send_message("You cannot add balls after ready.", ephemeral=True)
-            return
-
-        ball = Ball(name=name, owner_id=interaction.user.id, health=health, attack=attack, shiny=shiny, special=special)
-        apply_special_buffs(ball)
-        battle.players_balls[interaction.user.id].append(ball)
-        await interaction.response.send_message(f"Added {ball.name} to your deck.", ephemeral=True)
+    @app_commands.command()
+    async def remove(self, interaction: discord.Interaction, ball: BallInstance):
+        count = await self.remove_balls(interaction, [ball])
+        if count == 0:
+            await interaction.response.send_message("Ball not in deck.", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"Removed {ball.countryball.country} from deck.", ephemeral=True)
 
     # -------------------------
-    # /battle remove
+    # /battle bulk add
     # -------------------------
-    @app_commands.command(name="battle_remove")
-    async def remove(self, interaction: discord.Interaction, name: str):
-        """Remove a ball from your pre-battle deck"""
-        battle = next((b for b in self.battles.values() if interaction.user.id in b.players_balls), None)
-        if not battle:
-            await interaction.response.send_message("You are not in a battle.", ephemeral=True)
-            return
-
-        if battle.ready_players.get(interaction.user.id, False):
-            await interaction.response.send_message("You cannot remove balls after ready.", ephemeral=True)
-            return
-
-        balls = battle.players_balls.get(interaction.user.id, [])
-        removed = [b for b in balls if b.name == name]
-        if not removed:
-            await interaction.response.send_message("Ball not found in your deck.", ephemeral=True)
-            return
-        for b in removed:
-            balls.remove(b)
-        await interaction.response.send_message(f"Removed {name} from your deck.", ephemeral=True)
+    @app_commands.command()
+    async def bulk_add(self, interaction: discord.Interaction):
+        player, _ = await Player.get_or_create(discord_id=interaction.user.id)
+        balls = await BallInstance.filter(player=player)
+        added = await self.add_balls(interaction, balls)
+        await interaction.response.send_message(f"Added {added} balls to deck.", ephemeral=True)
 
     # -------------------------
-    # /battle bulk
+    # /battle bulk remove
     # -------------------------
-    @app_commands.command(name="battle_bulk")
-    async def bulk(self, interaction: discord.Interaction, count: int):
-        """Add multiple generic balls to your deck (solo only)"""
-        battle = next((b for b in self.battles.values() if interaction.user.id in b.players_balls), None)
-        if not battle:
-            await interaction.response.send_message("You are not in a battle.", ephemeral=True)
-            return
-
-        if battle.mode != "solo":
-            await interaction.response.send_message("Bulk adding is only allowed in solo battles.", ephemeral=True)
-            return
-
-        if battle.ready_players.get(interaction.user.id, False):
-            await interaction.response.send_message("You cannot bulk add after ready.", ephemeral=True)
-            return
-
-        for i in range(count):
-            ball = Ball(name=f"GenericBall{i+1}", owner_id=interaction.user.id, health=500, attack=100)
-            battle.players_balls[interaction.user.id].append(ball)
-
-        await interaction.response.send_message(f"Added {count} generic balls to your deck.", ephemeral=True)
-
-    # -------------------------
-    # /battle ready
-    # -------------------------
-    @app_commands.command(name="battle_ready")
-    async def ready(self, interaction: discord.Interaction):
-        """Mark yourself ready to start the battle"""
-        battle = next((b for b in self.battles.values() if interaction.user.id in b.players_balls), None)
-        if not battle:
-            await interaction.response.send_message("You are not in a battle.", ephemeral=True)
-            return
-
-        battle.ready_players[interaction.user.id] = True
-        await interaction.response.send_message("You are now ready!", ephemeral=True)
-
-        # Check if all players ready
-        if all(battle.ready_players[pid] for pid in battle.players_balls):
-            battle.started = True
-            await self.run_battle(battle, interaction.channel)
-
-    # -------------------------
-    # Battle Runner
-    # -------------------------
-    async def run_battle(self, battle: BattleInstance, channel: discord.TextChannel):
-        logs = []
-        alive = True
-        while alive:
-            current_pid = battle.turn_order[battle.current_turn_index]
-            player_balls = [b for b in battle.players_balls[current_pid] if not b.dead]
-
-            # Get enemy balls
-            enemy_pids = [pid for pid in battle.players_balls if pid != current_pid]
-            enemy_balls = [b for pid in enemy_pids for b in battle.players_balls[pid] if not b.dead]
-
-            if not player_balls or not enemy_balls:
-                alive = False
-                break
-
-            attacker = random.choice(player_balls)
-            log_entry = attack(attacker, enemy_balls)
-            logs.append(f"Player {current_pid}: {log_entry}")
-
-            if is_battle_over(battle):
-                alive = False
-                break
-
-            next_turn(battle)
-
-        battle.logs = logs
-        # Determine winner
-        for team, players in battle.teams.items():
-            if any(not b.dead for pid in players for b in battle.players_balls[pid]):
-                battle.winner = f"Team {team}"
-                break
-
-        # Send battle log
-        text = "\n".join(logs)
-        await channel.send(f"Battle {battle.battle_id} finished! Winner: {battle.winner}\n```{text}```")
+    @app_commands.command()
+    async def bulk_remove(self, interaction: discord.Interaction):
+        player, _ = await Player.get_or_create(discord_id=interaction.user.id)
+        balls = await BallInstance.filter(player=player)
+        removed = await self.remove_balls(interaction, balls)
+        await interaction.response.send_message(f"Removed {removed} balls from deck.", ephemeral=True)
 
 # -------------------------
 # Setup
 # -------------------------
 async def setup(bot):
-    await bot.add_cog(BattleCog(bot))
+    await bot.add_cog(FullBattleSystemCog(bot))
