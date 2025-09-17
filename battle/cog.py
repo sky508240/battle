@@ -4,7 +4,7 @@ from discord import app_commands
 
 # Import the BallInstanceTransform (already exists in your repo)
 from ballsdex.core.models import BallInstance
-from ballsdex.core.transformers import BallInstanceTransform
+from ballsdex.core.utils.transformers import BallInstanceTransform
 
 
 SPECIALS = {
