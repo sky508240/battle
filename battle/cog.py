@@ -2,13 +2,12 @@ import discord
 from discord import app_commands, ui
 from discord.ext import commands
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Optional
 import random
-import io
 
 from ballsdex.core.models import BallInstance, Player
 from ballsdex.settings import settings
-from ballsdex.packages.battle.xe_battle_lib import BattleBall, BattleInstance, gen_battle
+from ballsdex.packages.battle.xe_battle_lib import BattleBall, BattleInstance
 
 # -------------------------
 # Guild Battle container
@@ -61,11 +60,16 @@ class FullBattleSystemCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    battle_group = app_commands.Group(
+        name="battle",
+        description="Battle commands"
+    )
+
     # -------------------------
     # /battle start
     # -------------------------
-    @app_commands.command()
-    async def battle(self, interaction: discord.Interaction, opponent: discord.Member):
+    @battle_group.command(name="start", description="Start a battle with an opponent")
+    async def start(self, interaction: discord.Interaction, opponent: discord.Member):
         if opponent.bot or opponent == interaction.user:
             await interaction.response.send_message("Invalid opponent.", ephemeral=True)
             return
@@ -89,7 +93,7 @@ class FullBattleSystemCog(commands.Cog):
         await interaction.response.send_message(f"{opponent.mention}, {interaction.user.name} challenged you!", embed=embed, view=view)
 
     # -------------------------
-    # Add / Remove Balls
+    # Add / Remove Balls helpers
     # -------------------------
     async def add_balls(self, interaction: discord.Interaction, balls: List[BallInstance]):
         gb = fetch_battle(interaction.user)
@@ -142,9 +146,9 @@ class FullBattleSystemCog(commands.Cog):
         return removed
 
     # -------------------------
-    # /battle add single
+    # /battle add
     # -------------------------
-    @app_commands.command()
+    @battle_group.command(name="add", description="Add a ball to your deck")
     async def add(self, interaction: discord.Interaction, ball: BallInstance):
         count = await self.add_balls(interaction, [ball])
         if count == 0:
@@ -153,9 +157,9 @@ class FullBattleSystemCog(commands.Cog):
             await interaction.response.send_message(f"Added {ball.countryball.country} to deck.", ephemeral=True)
 
     # -------------------------
-    # /battle remove single
+    # /battle remove
     # -------------------------
-    @app_commands.command()
+    @battle_group.command(name="remove", description="Remove a ball from your deck")
     async def remove(self, interaction: discord.Interaction, ball: BallInstance):
         count = await self.remove_balls(interaction, [ball])
         if count == 0:
@@ -164,9 +168,9 @@ class FullBattleSystemCog(commands.Cog):
             await interaction.response.send_message(f"Removed {ball.countryball.country} from deck.", ephemeral=True)
 
     # -------------------------
-    # /battle bulk add
+    # /battle bulk_add
     # -------------------------
-    @app_commands.command()
+    @battle_group.command(name="bulk_add", description="Add all your balls to your deck")
     async def bulk_add(self, interaction: discord.Interaction):
         player, _ = await Player.get_or_create(discord_id=interaction.user.id)
         balls = await BallInstance.filter(player=player)
@@ -174,14 +178,15 @@ class FullBattleSystemCog(commands.Cog):
         await interaction.response.send_message(f"Added {added} balls to deck.", ephemeral=True)
 
     # -------------------------
-    # /battle bulk remove
+    # /battle bulk_remove
     # -------------------------
-    @app_commands.command()
+    @battle_group.command(name="bulk_remove", description="Remove all your balls from your deck")
     async def bulk_remove(self, interaction: discord.Interaction):
         player, _ = await Player.get_or_create(discord_id=interaction.user.id)
         balls = await BallInstance.filter(player=player)
         removed = await self.remove_balls(interaction, balls)
         await interaction.response.send_message(f"Removed {removed} balls from deck.", ephemeral=True)
+
 
 # -------------------------
 # Setup
