@@ -1,11 +1,8 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-
-# Import the BallInstanceTransform (already exists in your repo)
-from ballsdex.core.models import BallInstance
+from ballsdex.core.models import BallInstance, Player
 from ballsdex.core.utils.transformers import BallInstanceTransform
-
 
 SPECIALS = {
     "Shiny": {"extra_health": 2500, "extra_attack": 2500},
@@ -15,11 +12,12 @@ SPECIALS = {
     "Boss": {"extra_health": 10000, "extra_attack": 10000},
 }
 
+MAX_BALLS = 50
 
 class FullBattleSystemCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.active_battles = {}
+        self.active_battles = {}  # channel_id -> battle info
 
     # ---------------------------
     # /battle start
@@ -27,24 +25,22 @@ class FullBattleSystemCog(commands.Cog):
     @app_commands.command(name="start", description="Start a solo or multiplayer battle")
     @app_commands.describe(
         mode="Battle mode: solo or multiplayer",
-        opponents="User to challenge (for solo mode)",
+        opponent="User to challenge (solo mode only)",
         team_size="Number of players per team (multiplayer only, default 3)"
     )
     async def start(
         self,
         interaction: discord.Interaction,
         mode: str,
-        opponents: discord.Member = None,
+        opponent: discord.Member = None,
         team_size: int = 3,
     ):
         if mode not in ["solo", "multiplayer"]:
-            await interaction.response.send_message("Invalid mode. Choose solo or multiplayer.", ephemeral=True)
+            await interaction.response.send_message("Invalid mode.", ephemeral=True)
             return
-
-        if mode == "solo" and not opponents:
-            await interaction.response.send_message("You must specify an opponent in solo mode.", ephemeral=True)
+        if mode == "solo" and not opponent:
+            await interaction.response.send_message("You must specify an opponent.", ephemeral=True)
             return
-
         if mode == "multiplayer":
             if team_size < 2 or team_size > 25:
                 await interaction.response.send_message("Team size must be between 2 and 25.", ephemeral=True)
@@ -56,9 +52,8 @@ class FullBattleSystemCog(commands.Cog):
             "team_size": team_size if mode == "multiplayer" else 1,
             "started": False,
         }
-
-        if opponents:
-            self.active_battles[interaction.channel.id]["players"][opponents.id] = []
+        if opponent:
+            self.active_battles[interaction.channel.id]["players"][opponent.id] = []
 
         await interaction.response.send_message(
             f"Battle created in **{mode}** mode. Use `/battle add` to add your balls!"
@@ -75,26 +70,19 @@ class FullBattleSystemCog(commands.Cog):
     ):
         battle = self.active_battles.get(interaction.channel.id)
         if not battle:
-            await interaction.response.send_message("No battle is active here.", ephemeral=True)
+            await interaction.response.send_message("No active battle here.", ephemeral=True)
             return
-
         if battle["started"]:
-            await interaction.response.send_message("Battle already started, you cannot add more balls.", ephemeral=True)
+            await interaction.response.send_message("Battle started, cannot add.", ephemeral=True)
             return
 
-        if interaction.user.id not in battle["players"]:
-            battle["players"][interaction.user.id] = []
-
-        if len(battle["players"][interaction.user.id]) >= 50:
-            await interaction.response.send_message("You cannot add more than 50 balls.", ephemeral=True)
+        user_balls = battle["players"].setdefault(interaction.user.id, [])
+        if len(user_balls) >= MAX_BALLS:
+            await interaction.response.send_message("Cannot add more than 50 balls.", ephemeral=True)
             return
 
-        stats = self._apply_specials(ball)
-        battle["players"][interaction.user.id].append(stats)
-
-        await interaction.response.send_message(
-            f"Added **{ball.country}** with {stats['health']} HP and {stats['attack']} ATK to the battle!"
-        )
+        user_balls.append(self._apply_specials(ball))
+        await interaction.response.send_message(f"Added **{ball.country}** to the battle!")
 
     # ---------------------------
     # /battle remove
@@ -106,69 +94,60 @@ class FullBattleSystemCog(commands.Cog):
         ball: BallInstanceTransform,
     ):
         battle = self.active_battles.get(interaction.channel.id)
-        if not battle:
-            await interaction.response.send_message("No battle is active here.", ephemeral=True)
-            return
-
-        if interaction.user.id not in battle["players"]:
+        if not battle or interaction.user.id not in battle["players"]:
             await interaction.response.send_message("You have no balls in this battle.", ephemeral=True)
             return
 
-        for b in battle["players"][interaction.user.id]:
+        user_balls = battle["players"][interaction.user.id]
+        for b in user_balls:
             if b["id"] == ball.id:
-                battle["players"][interaction.user.id].remove(b)
-                await interaction.response.send_message(
-                    f"Removed **{ball.country}** from the battle."
-                )
+                user_balls.remove(b)
+                await interaction.response.send_message(f"Removed **{ball.country}**.")
                 return
-
-        await interaction.response.send_message("That ball is not in the battle.", ephemeral=True)
+        await interaction.response.send_message("Ball not in your deck.", ephemeral=True)
 
     # ---------------------------
     # /battle bulk
     # ---------------------------
-    @app_commands.command(name="bulk", description="Add multiple balls at once (solo only)")
-    async def bulk(
-        self,
-        interaction: discord.Interaction,
-        balls: app_commands.Transform[list[BallInstance], BallInstanceTransform],
-    ):
+    @app_commands.command(name="bulk", description="Add all your balls to the battle (solo only)")
+    async def bulk(self, interaction: discord.Interaction):
         battle = self.active_battles.get(interaction.channel.id)
         if not battle:
-            await interaction.response.send_message("No battle is active here.", ephemeral=True)
+            await interaction.response.send_message("No active battle here.", ephemeral=True)
             return
-
         if battle["mode"] == "multiplayer":
-            await interaction.response.send_message("Bulk add is not allowed in multiplayer mode.", ephemeral=True)
+            await interaction.response.send_message("Bulk not allowed in multiplayer.", ephemeral=True)
             return
-
         if battle["started"]:
-            await interaction.response.send_message("Battle already started, you cannot bulk add.", ephemeral=True)
+            await interaction.response.send_message("Battle started, cannot bulk add.", ephemeral=True)
             return
 
-        if interaction.user.id not in battle["players"]:
-            battle["players"][interaction.user.id] = []
+        player, _ = await Player.get_or_create(discord_id=interaction.user.id)
+        balls = await BallInstance.filter(player=player)
+        user_balls = battle["players"].setdefault(interaction.user.id, [])
 
+        added = 0
         for ball in balls:
-            stats = self._apply_specials(ball)
-            battle["players"][interaction.user.id].append(stats)
+            if len(user_balls) >= MAX_BALLS:
+                break
+            user_balls.append(self._apply_specials(ball))
+            added += 1
 
-        await interaction.response.send_message(
-            f"Added {len(balls)} balls to the battle for {interaction.user.display_name}."
-        )
+        await interaction.response.send_message(f"Added {added} balls to your deck.")
 
     # ---------------------------
-    # Helpers
+    # Helper: Apply Specials
     # ---------------------------
     def _apply_specials(self, ball: BallInstance) -> dict:
-        stats = {
-            "id": ball.id,
-            "country": ball.country,
-            "health": ball.health,
-            "attack": ball.attack,
-        }
+        stats = {"id": ball.id, "country": ball.country, "health": ball.health, "attack": ball.attack}
         for special, bonus in SPECIALS.items():
             if getattr(ball, "special", None) == special:
                 stats["health"] += bonus["extra_health"]
                 stats["attack"] += bonus["extra_attack"]
         return stats
+
+# ---------------------------
+# Setup
+# ---------------------------
+async def setup(bot: commands.Bot):
+    await bot.add_cog(FullBattleSystemCog(bot))
